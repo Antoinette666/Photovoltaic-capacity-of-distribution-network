@@ -1,0 +1,221 @@
+function result = droop_control(cap_kW)
+%Solve_One_PV_Capacity_Centralized
+% 给定光伏总容量下的分散式无功优化模型
+%内层控制
+% 输入：
+% cap_total_kW  当前测试的光伏总接入容量，kW
+%
+% 输出：
+% result        当前容量下的求解结果和可行性判断
+warning off
+format short
+
+NT=24;%优化时间
+SB=10;%基准功率MVA标幺化基准值
+VBase=12.66;%基准电压KV
+ZB=VBase^2/SB;%基准电抗kv
+IB=SB/(sqrt(3)*VBase);%基准电流ka
+
+%% ===== 从数据文件加载系统参数 =====
+[PDN_Data, Pd_total, Qd_total, loc2, solar_data] = get_PDN_Data();
+
+NL=size(PDN_Data,1);NB=NL+1;%NL为线路数
+L_i=PDN_Data(:,2);
+L_j=PDN_Data(:,3);
+P_load=PDN_Data(:,4);
+Q_load=PDN_Data(:,5);
+R=PDN_Data(:,6)/ZB;
+X=PDN_Data(:,7)/ZB;
+Pmax=PDN_Data(:,8)/SB;
+Pmin=PDN_Data(:,9)/SB;
+
+Bc_base = 0.0025; % 基准对地电纳 (p.u.)
+Bc = Bc_base * ones(NL, 1); % 每条线路的对地电纳
+
+U2_min=0.95^2;%电压^2min
+U2_max=1.05^2;%电压^2max
+
+Ind_Subline=zeros(NL,2);%各线路的子线路编号
+for i=1:NL
+    temp=find(L_i==L_j(i));
+    if ~isempty(temp)
+        Ind_Subline(i,1:length(temp))=temp;
+    end
+end
+
+Pd=P_load*Pd_total/1000000;%转换成PU
+Qd=Q_load*Qd_total/1000000;%转换成PU
+Pd=[zeros(1,24);Pd];%加了一行0
+Qd=[zeros(1,24);Qd];
+
+%%%%%%% 配电网中决策变量 %%%%%%%
+P = sdpvar(NL,NT);% 线路首端有功功率
+Q = sdpvar(NL,NT); % 线路首端无功功率
+P_kidline = sdpvar(NL,NT);% 各条线路紧邻的下游子线路首端功率
+Q_kidline = sdpvar(NL,NT); %
+U2 = sdpvar(NB,NT); % 节点电压幅值平方
+I2 = sdpvar(NL,NT);
+
+%% ========== PV 光伏变量 ==========
+Psolar = zeros(NB, NT);              % kW，固定预测值   Psolar=sdpvar(33,24);
+Qsolar=sdpvar(NB, NT, 'full');%MW
+Ind_NoPV=setdiff(1:NB, loc2);%无光伏出力节点
+Cons_ES = [];
+Cons_ES =[Cons_ES,Qsolar(Ind_NoPV,:) == 0];%非光伏节点出力为0
+nPV = length(loc2);
+
+%% ========== 按承载力容量缩放光伏有功 ==========
+% cap_kW 是当前外层循环测试的总光伏容量。
+% solar_data 只作为日内出力形状曲线，先归一化，再按容量缩放。
+
+if nPV == 0 || cap_kW <= 1e-6
+    pv_cap_each = zeros(nPV, 1);
+else
+    pv_cap_each = cap_kW / nPV * ones(nPV, 1);%平均分配到每个光伏节点
+end
+
+pv_shape = zeros(nPV, NT);
+
+for k = 1:nPV
+
+    temp = solar_data(k, :);
+
+    if max(temp) <= 1e-6
+        pv_shape(k, :) = zeros(1, NT);
+    else
+        pv_shape(k, :) = temp / max(temp);%归一化为 0~1 的日内出力曲线
+    end
+
+end
+
+for k = 1:nPV
+    node = loc2(k);
+    Psolar(node, :) = pv_cap_each(k) * pv_shape(k, :);
+end
+
+%% ========== 可用无功容量 ==========
+Qmax = zeros(NB, NT);
+S=1000;%kw单个光伏逆变器
+for k = 1:length(loc2)
+    node = loc2(k);
+    Qmax(node, :) = sqrt(max(0, S^2 - Psolar(node, :).^2));
+end
+
+%%%%%%%% 配电网约束 %%%%%%%%
+Cons_P= []; Cons_Q = []; Cons_U = []; Cons_I = []; Cons_SOC = [];
+%%%%%%%%% 潮流约束 %%%%%%%%%
+for t = 1:NT
+    for i = 1:NL
+        
+        Qc_i = Bc(i) * U2(L_i(i), t);
+        % 线路末端对地电容产生的无功  
+        Qc_j = Bc(i) * U2(L_j(i), t);
+        
+        % 总的对地电容无功注入
+        Qc_total = Qc_i + Qc_j;
+
+        %计算支路功率
+        num_temp = size(find(Ind_Subline(i,:) == 0),2);%统计第 i 行里有几个支路
+        if num_temp == 1
+            Cons_P = [Cons_P,P_kidline(i,t) == P(Ind_Subline(i,1),t)];
+            Cons_Q = [Cons_Q,Q_kidline(i,t) == Q(Ind_Subline(i,1),t)];
+        elseif num_temp == 2
+            Cons_P = [Cons_P,P_kidline(i,t) == 0];
+            Cons_Q = [Cons_Q,Q_kidline(i,t) == 0];
+        else
+            Cons_P = [Cons_P, P_kidline(i,t) == P(Ind_Subline(i,1),t) + P(Ind_Subline(i,2),t)];
+            Cons_Q = [Cons_Q, Q_kidline(i,t) == Q(Ind_Subline(i,1),t) + Q(Ind_Subline(i,2),t)];
+        end
+    end
+end
+
+Cons_P=[Cons_P,(P-diag(R)*I2+Psolar(L_j,:)/10000== P_kidline + Pd(L_j,:))];
+QcLine = repmat(Bc, 1, NT) .* U2(L_i, :) + repmat(Bc, 1, NT) .* U2(L_j, :);
+Cons_Q = [Cons_Q, ...
+    Q - diag(X) * I2 + Qsolar(L_j,:) / 10000 + QcLine == Q_kidline + Qd(L_j,:)];
+Cons_U=[Cons_U, U2(L_j,:)== U2(L_i,:)-2*(diag(R)*P + diag(X)*Q)+(diag(R)^2 + diag(X)^2)*I2];
+Cons_SOC = [Cons_SOC, I2(1:NL,:).* U2(L_i,:) >= P(1:NL,:).^2 + Q(1:NL,:).^2];%基于 DistFlow 的二阶锥松弛技术
+
+%%%%%%%% 配电网运行安全约束 %%%%%%%%%
+Cons_U = [Cons_U, U2(1,:) == 1.0^2];
+Cons_U = [Cons_U, (U2_min<=U2<=U2_max)];
+Cons_I = [Cons_I,0<=I2];
+
+%% ========== 下垂控制 ==========
+[Cons_Droop, U] = QU_Droop(U2, Qsolar, Qmax, loc2, NB, NT);
+
+Cons = [Cons_P, Cons_Q, Cons_U, Cons_I, Cons_SOC, Cons_ES,Cons_Droop];
+%% ========== 目标函数：最小化电压偏移量 ==========
+Vref = 1.0;   % 参考电压，p.u.
+Obj = 0;% 通常不计入平衡节点 1，只优化其余节点电压偏移
+
+%% ========== 求解 ==========
+ops = sdpsettings('solver', 'gurobi', 'verbose', 1);
+
+sol = optimize(Cons, Obj, ops);
+
+%% ========== 初始化输出 ==========
+result = struct();
+
+result.cap_total_kW = cap_kW;
+result.is_feasible = false;
+result.violation_type = "";
+result.max_U = NaN;
+result.min_U = NaN;
+result.max_I2 = NaN;
+result.Obj_value = NaN;
+result.sol_info = sol.info;
+
+result.U_opt_pu = [];
+result.U2_opt = [];
+result.I2_opt = [];
+result.Psolar_kW = Psolar;
+result.Qsolar_opt_kvar = [];
+
+%% ========== 判断求解状态 ==========
+if sol.problem ~= 0
+
+    result.is_feasible = false;
+    result.violation_type = "优化不可行或求解失败：" + string(sol.info);
+
+    return;
+
+end
+
+%% ========== 提取结果 ==========
+U_opt_pu = value(U);
+U2_opt = value(U2);
+I2_opt = value(I2);
+Qsolar_opt = value(Qsolar);
+
+result.U_opt_pu = U_opt_pu;
+result.U2_opt = U2_opt;
+result.I2_opt = I2_opt;
+result.Qsolar_opt_kvar = Qsolar_opt;
+result.Obj_value = value(Obj);
+
+result.max_U = max(U_opt_pu(:));
+result.min_U = min(U_opt_pu(:));
+result.max_I2 = max(I2_opt(:));
+
+%% ========== 越限判断 ==========
+tol = 1e-5;
+
+if result.max_U > 1.05 + tol
+
+    result.is_feasible = false;
+    result.violation_type = "节点电压越上限";
+
+elseif result.min_U < 0.95 - tol
+
+    result.is_feasible = false;
+    result.violation_type = "节点电压越下限";
+
+else
+
+    result.is_feasible = true;
+    result.violation_type = "无越限";
+
+end
+
+end
